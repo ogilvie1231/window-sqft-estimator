@@ -65,7 +65,29 @@ export default function App() {
     return total;
   }, [pixelsPerInch, windowBoxes]);
 
+  const [view, setView] = useState({ scale: 1, tx: 0, ty: 0 }); // screen-space transform
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const pinchStart = useRef<null | {
+    dist: number;
+    mid: { x: number; y: number };
+    scale: number;
+    tx: number;
+    ty: number;
+  }>(null);
 
+  function dist(a: { x: number; y: number }, b: { x: number; y: number }) {
+    const dx = a.x - b.x;
+    const dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  
+  function mid(a: { x: number; y: number }, b: { x: number; y: number }) {
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+  }
+  
+  function clampScale(s: number) {
+    return Math.max(1, Math.min(6, s)); // min 1x, max 6x
+  }
   function resetAll() {
     setBoxes([]);
     setDraftBox(null);
@@ -88,56 +110,75 @@ export default function App() {
   }
 
   const getCanvasAndImageScale = React.useCallback(() => {
-    const canvas = canvasRef.current;
-    const img = imgRef.current;
-    if (!canvas || !img || !imageNatural) return null;
-  
-    const rect = canvas.getBoundingClientRect();
-    const displayW = rect.width;
-    const displayH = rect.height;
-  
-    const imgAspect = imageNatural.w / imageNatural.h;
-    const canvasAspect = displayW / displayH;
-  
-    let drawW = displayW;
-    let drawH = displayH;
-    let offsetX = 0;
-    let offsetY = 0;
-  
-    if (imgAspect > canvasAspect) {
-      drawW = displayW;
-      drawH = displayW / imgAspect;
-      offsetY = (displayH - drawH) / 2;
-    } else {
-      drawH = displayH;
-      drawW = displayH * imgAspect;
-      offsetX = (displayW - drawW) / 2;
-    }
-  
-    const scale = drawW / imageNatural.w;
-  
-    return { canvas, rect, drawW, drawH, offsetX, offsetY, scale };
-  }, [imageNatural]);
+  const canvas = canvasRef.current;
+  const img = imgRef.current;
+  if (!canvas || !img || !imageNatural) return null;
 
-  function canvasPointToImagePoint(clientX: number, clientY: number) {
-    const info = getCanvasAndImageScale();
-    if (!info) return null;
+  const rect = canvas.getBoundingClientRect();
+  const displayW = rect.width;
+  const displayH = rect.height;
 
-    const { rect, offsetX, offsetY, scale, drawW, drawH } = info;
-    const xCanvas = clientX - rect.left;
-    const yCanvas = clientY - rect.top;
+  // Base "contain" placement of image in the canvas
+  const imgAspect = imageNatural.w / imageNatural.h;
+  const canvasAspect = displayW / displayH;
 
-    const xInDraw = xCanvas - offsetX;
-    const yInDraw = yCanvas - offsetY;
+  let baseW = displayW;
+  let baseH = displayH;
+  let baseOffsetX = 0;
+  let baseOffsetY = 0;
 
-    if (xInDraw < 0 || yInDraw < 0 || xInDraw > drawW || yInDraw > drawH) return null;
-
-    // convert to image natural px
-    const xImg = xInDraw / scale;
-    const yImg = yInDraw / scale;
-
-    return { x: xImg, y: yImg };
+  if (imgAspect > canvasAspect) {
+    baseW = displayW;
+    baseH = displayW / imgAspect;
+    baseOffsetY = (displayH - baseH) / 2;
+  } else {
+    baseH = displayH;
+    baseW = displayH * imgAspect;
+    baseOffsetX = (displayW - baseW) / 2;
   }
+
+  // Base scale maps image px -> canvas px (before zoom)
+  const baseScale = baseW / imageNatural.w;
+
+  return {
+    canvas,
+    rect,
+    baseW,
+    baseH,
+    baseOffsetX,
+    baseOffsetY,
+    baseScale,
+  };
+}, [imageNatural]);
+
+function canvasPointToImagePoint(clientX: number, clientY: number) {
+  const info = getCanvasAndImageScale();
+  if (!info) return null;
+
+  const { rect, baseOffsetX, baseOffsetY, baseScale } = info;
+
+  // Pointer position in canvas CSS pixels
+  const xCanvas = clientX - rect.left;
+  const yCanvas = clientY - rect.top;
+
+  // Remove the base contain offset
+  const xInBase = xCanvas - baseOffsetX;
+  const yInBase = yCanvas - baseOffsetY;
+
+  // Undo our zoom/pan (view transform happens in base space)
+  const xUnzoom = (xInBase - view.tx) / view.scale;
+  const yUnzoom = (yInBase - view.ty) / view.scale;
+
+  // Convert base-space px -> image px
+  const xImg = xUnzoom / baseScale;
+  const yImg = yUnzoom / baseScale;
+
+  // Bounds check in image space
+  if (xImg < 0 || yImg < 0 || !imageNatural) return null;
+  if (xImg > imageNatural.w || yImg > imageNatural.h) return null;
+
+  return { x: xImg, y: yImg };
+}
 
   function handlePointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     if (!imageUrl) return;
@@ -239,20 +280,36 @@ export default function App() {
     if (!info) return;
     const { drawW, drawH, offsetX, offsetY, scale } = info;
 
-    // draw image
-    ctx.drawImage(img, offsetX, offsetY, drawW, drawH);
+    const info = getCanvasAndImageScale();
+if (!info) return;
+
+const { baseW, baseH, baseOffsetX, baseOffsetY, baseScale } = info;
+
+// draw image with zoom transform
+ctx.save();
+ctx.translate(baseOffsetX + view.tx, baseOffsetY + view.ty);
+ctx.scale(view.scale, view.scale);
+ctx.drawImage(img, 0, 0, baseW, baseH);
+ctx.restore();
 
     // helper to draw a box from image coords
     const drawBox = (b: Box, stroke: string) => {
-  const x = offsetX + b.x * scale;
-  const y = offsetY + b.y * scale;
-  const w = b.w * scale;
-  const h = b.h * scale;
-
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = stroke;
-  ctx.strokeRect(x, y, w, h);
-};
+      // box is in image px; convert to base canvas px
+      const xBase = b.x * baseScale;
+      const yBase = b.y * baseScale;
+      const wBase = b.w * baseScale;
+      const hBase = b.h * baseScale;
+    
+      // then apply view transform + base offsets
+      const x = baseOffsetX + view.tx + xBase * view.scale;
+      const y = baseOffsetY + view.ty + yBase * view.scale;
+      const w = wBase * view.scale;
+      const h = hBase * view.scale;
+    
+      ctx.lineWidth = window.innerWidth < 980 ? 3 : 2; // easier on mobile
+      ctx.strokeStyle = stroke;
+      ctx.strokeRect(x, y, w, h);
+    };
 
     // existing boxes
     for (const b of boxes) {
@@ -267,7 +324,7 @@ export default function App() {
     : "rgba(255,200,0,0.9)";
   drawBox(draftBox, color);
 }
-  }, [boxes, draftBox, imageUrl, imageNatural, getCanvasAndImageScale]);
+}, [boxes, draftBox, imageUrl, imageNatural, view, getCanvasAndImageScale]);
 
   return (
     <div className="wrap">
@@ -288,6 +345,9 @@ export default function App() {
             <button className="btn" onClick={resetAll} disabled={!imageUrl}>
               Clear boxes
             </button>
+            <button className="btn" onClick={() => setView({ scale: 1, tx: 0, ty: 0 })} disabled={!imageUrl}>
+  Reset view
+</button>
           </div>
 
           {!imageUrl ? (
@@ -309,18 +369,75 @@ export default function App() {
               />
 
               <div className="canvasWrap">
-                <canvas
-                  ref={canvasRef}
-                  className="canvas"
-                  onPointerDown={handlePointerDown}
-                  onPointerMove={handlePointerMove}
-                  onPointerUp={handlePointerUp}
-                  onPointerLeave={() => {
-                    // end drawing if pointer leaves
-                    setDragStart(null);
-                    setDraftBox(null);
-                  }}
-                />
+              <canvas
+  ref={canvasRef}
+  className="canvas"
+  onPointerDown={(e) => {
+    (e.currentTarget as HTMLCanvasElement).setPointerCapture(e.pointerId);
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    // If 2 pointers -> start pinch
+    if (pointers.current.size === 2) {
+      const pts = Array.from(pointers.current.values());
+      const d = dist(pts[0], pts[1]);
+      const m = mid(pts[0], pts[1]);
+      pinchStart.current = { dist: d, mid: m, scale: view.scale, tx: view.tx, ty: view.ty };
+      // stop any box drawing
+      setDragStart(null);
+      setDraftBox(null);
+      return;
+    }
+
+    // 1 pointer -> normal drawing
+    handlePointerDown(e);
+  }}
+  onPointerMove={(e) => {
+    if (!pointers.current.has(e.pointerId)) return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    // Pinch/2-finger pan
+    if (pointers.current.size === 2 && pinchStart.current) {
+      const pts = Array.from(pointers.current.values());
+      const dNow = dist(pts[0], pts[1]);
+      const mNow = mid(pts[0], pts[1]);
+
+      const start = pinchStart.current;
+      const nextScale = clampScale(start.scale * (dNow / start.dist));
+
+      // Keep the midpoint anchored (pan as fingers move)
+      const dxMid = mNow.x - start.mid.x;
+      const dyMid = mNow.y - start.mid.y;
+
+      setView({
+        scale: nextScale,
+        tx: start.tx + dxMid,
+        ty: start.ty + dyMid,
+      });
+      return;
+    }
+
+    // 1 pointer -> normal drawing
+    handlePointerMove(e);
+  }}
+  onPointerUp={(e) => {
+    pointers.current.delete(e.pointerId);
+
+    if (pointers.current.size < 2) {
+      pinchStart.current = null;
+    }
+
+    // Only finish box draw if it was a 1-finger interaction
+    if (pointers.current.size === 0) {
+      handlePointerUp();
+    }
+  }}
+  onPointerCancel={(e) => {
+    pointers.current.delete(e.pointerId);
+    pinchStart.current = null;
+    setDragStart(null);
+    setDraftBox(null);
+  }}
+/>
               </div>
 
               <div className="row">
