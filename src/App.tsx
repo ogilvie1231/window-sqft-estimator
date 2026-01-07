@@ -13,34 +13,11 @@ type Box = {
   h: number;
 };
 
-type PricingConfig = {
-  // You can tune these freely for your partnership/MVP
-  materialCostPerSqft: number; // your cost
-  laborCostPerSqft: number; // install labor allocation
-  miscPerJob: number; // blades, solution, travel buffer, etc.
-  minCharge: number; // minimum job charge
-  marginFloor: number; // e.g. 0.45 = 45%
-  marginTarget: number; // e.g. 0.55 = 55%
-  marginStretch: number; // e.g. 0.65 = 65%
-};
-
-const DEFAULT_PRICING: PricingConfig = {
-  materialCostPerSqft: 2.25,
-  laborCostPerSqft: 3.25,
-  miscPerJob: 35,
-  minCharge: 399,
-  marginFloor: 0.45,
-  marginTarget: 0.55,
-  marginStretch: 0.65,
-};
 
 function uid() {
   return Math.random().toString(16).slice(2) + "-" + Date.now().toString(16);
 }
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
 
 function round2(n: number) {
   return Math.round(n * 100) / 100;
@@ -61,7 +38,6 @@ export default function App() {
 
   const [refPreset, setRefPreset] = useState<"paper" | "door" | "custom">("paper");
   const [refRealInches, setRefRealInches] = useState<number>(11); // paper height default 11"
-  const [pricing, setPricing] = useState<PricingConfig>(DEFAULT_PRICING);
 
   // derived: reference pixels per inch (ppi) using reference box height
   const referenceBox = useMemo(() => boxes.find((b) => b.type === "reference") ?? null, [boxes]);
@@ -89,34 +65,6 @@ export default function App() {
     return total;
   }, [pixelsPerInch, windowBoxes]);
 
-  const costAndPrice = useMemo(() => {
-    if (!windowSqft) return null;
-
-    const sqft = windowSqft;
-
-    const rawCost =
-      sqft * (pricing.materialCostPerSqft + pricing.laborCostPerSqft) + pricing.miscPerJob;
-
-    // Minimum charge applied at sell-price level typically, but we’ll also protect cost floor
-    const protectedCost = Math.max(rawCost, pricing.minCharge * (1 - pricing.marginFloor));
-
-    const floor = protectedCost / (1 - pricing.marginFloor);
-    const target = protectedCost / (1 - pricing.marginTarget);
-    const stretch = protectedCost / (1 - pricing.marginStretch);
-
-    const finalFloor = Math.max(floor, pricing.minCharge);
-    const finalTarget = Math.max(target, pricing.minCharge);
-    const finalStretch = Math.max(stretch, pricing.minCharge);
-
-    return {
-      sqft,
-      rawCost,
-      protectedCost,
-      sellFloor: finalFloor,
-      sellTarget: finalTarget,
-      sellStretch: finalStretch,
-    };
-  }, [windowSqft, pricing]);
 
   function resetAll() {
     setBoxes([]);
@@ -139,27 +87,24 @@ export default function App() {
     // custom leaves current value
   }
 
-  function getCanvasAndImageScale() {
+  const getCanvasAndImageScale = React.useCallback(() => {
     const canvas = canvasRef.current;
     const img = imgRef.current;
     if (!canvas || !img || !imageNatural) return null;
-
-    // Canvas is sized via CSS; we draw in canvas pixel space matching its displayed size.
+  
     const rect = canvas.getBoundingClientRect();
     const displayW = rect.width;
     const displayH = rect.height;
-
-    // Image is fit "contain" into the canvas area
+  
     const imgAspect = imageNatural.w / imageNatural.h;
     const canvasAspect = displayW / displayH;
-
+  
     let drawW = displayW;
     let drawH = displayH;
     let offsetX = 0;
     let offsetY = 0;
-
+  
     if (imgAspect > canvasAspect) {
-      // image is wider than canvas
       drawW = displayW;
       drawH = displayW / imgAspect;
       offsetY = (displayH - drawH) / 2;
@@ -168,12 +113,11 @@ export default function App() {
       drawW = displayH * imgAspect;
       offsetX = (displayW - drawW) / 2;
     }
-
-    // scale from image natural coords -> displayed draw coords
+  
     const scale = drawW / imageNatural.w;
-
+  
     return { canvas, rect, drawW, drawH, offsetX, offsetY, scale };
-  }
+  }, [imageNatural]);
 
   function canvasPointToImagePoint(clientX: number, clientY: number) {
     const info = getCanvasAndImageScale();
@@ -203,7 +147,6 @@ export default function App() {
     setDragStart(pt);
 
     // start a draft box at 1px to show feedback
-    const isRef = activeDrawType === "reference";
     const label =
       activeDrawType === "reference"
         ? refPreset === "paper"
@@ -324,7 +267,7 @@ export default function App() {
     : "rgba(255,200,0,0.9)";
   drawBox(draftBox, color);
 }
-  }, [boxes, draftBox, imageUrl, imageNatural]);
+  }, [boxes, draftBox, imageUrl, imageNatural, getCanvasAndImageScale]);
 
   return (
     <div className="wrap">
@@ -411,7 +354,9 @@ export default function App() {
             <label className="label">Reference preset</label>
             <select
               value={refPreset}
-              onChange={(e) => syncRefPreset(e.target.value as any)}
+              onChange={(e) =>
+                syncRefPreset(e.target.value as "paper" | "door" | "custom")
+              }
               className="input"
             >
               <option value="paper">Letter paper (11&quot; tall)</option>
