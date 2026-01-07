@@ -284,7 +284,7 @@ export default function App() {
         <section className="card">
           <h2>Photo</h2>
           <div className="row">
-            <input type="file" accept="image/*" capture="environment" onChange={onFileChange} />
+          <input type="file" accept="image/*" onChange={onFileChange} />
             <button className="btn" onClick={resetAll} disabled={!imageUrl}>
               Clear boxes
             </button>
