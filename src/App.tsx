@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 
 type BoxType = "reference" | "window";
@@ -13,11 +13,9 @@ type Box = {
   h: number;
 };
 
-
 function uid() {
   return Math.random().toString(16).slice(2) + "-" + Date.now().toString(16);
 }
-
 
 function round2(n: number) {
   return Math.round(n * 100) / 100;
@@ -39,33 +37,10 @@ export default function App() {
   const [refPreset, setRefPreset] = useState<"paper" | "door" | "custom">("paper");
   const [refRealInches, setRefRealInches] = useState<number>(11); // paper height default 11"
 
-  // derived: reference pixels per inch (ppi) using reference box height
-  const referenceBox = useMemo(() => boxes.find((b) => b.type === "reference") ?? null, [boxes]);
+  // View transform (pinch zoom + pan) in BASE canvas space
+  const [view, setView] = useState({ scale: 1, tx: 0, ty: 0 });
 
-  const pixelsPerInch = useMemo(() => {
-    if (!referenceBox) return null;
-    const real = refRealInches > 0 ? refRealInches : null;
-    if (!real) return null;
-    // Use height as the scaling axis (more stable in portrait shots)
-    return referenceBox.h / real;
-  }, [referenceBox, refRealInches]);
-
-  const windowBoxes = useMemo(() => boxes.filter((b) => b.type === "window"), [boxes]);
-
-  const windowSqft = useMemo(() => {
-    if (!pixelsPerInch) return null;
-    const ppi = pixelsPerInch;
-    let total = 0;
-    for (const b of windowBoxes) {
-      const wIn = b.w / ppi;
-      const hIn = b.h / ppi;
-      const sqft = (wIn * hIn) / 144;
-      total += sqft;
-    }
-    return total;
-  }, [pixelsPerInch, windowBoxes]);
-
-  const [view, setView] = useState({ scale: 1, tx: 0, ty: 0 }); // screen-space transform
+  // Pinch tracking
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const pinchStart = useRef<null | {
     dist: number;
@@ -80,18 +55,47 @@ export default function App() {
     const dy = a.y - b.y;
     return Math.sqrt(dx * dx + dy * dy);
   }
-  
+
   function mid(a: { x: number; y: number }, b: { x: number; y: number }) {
     return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
   }
-  
+
   function clampScale(s: number) {
     return Math.max(1, Math.min(6, s)); // min 1x, max 6x
   }
+
+  // derived: reference pixels per inch (ppi) using reference box height
+  const referenceBox = useMemo(() => boxes.find((b) => b.type === "reference") ?? null, [boxes]);
+
+  const pixelsPerInch = useMemo(() => {
+    if (!referenceBox) return null;
+    const real = refRealInches > 0 ? refRealInches : null;
+    if (!real) return null;
+    return referenceBox.h / real; // use height axis
+  }, [referenceBox, refRealInches]);
+
+  const windowBoxes = useMemo(() => boxes.filter((b) => b.type === "window"), [boxes]);
+
+  const windowSqft = useMemo(() => {
+    if (!pixelsPerInch) return null;
+    const ppi = pixelsPerInch;
+    let total = 0;
+    for (const b of windowBoxes) {
+      const wIn = b.w / ppi;
+      const hIn = b.h / ppi;
+      total += (wIn * hIn) / 144;
+    }
+    return total;
+  }, [pixelsPerInch, windowBoxes]);
+
   function resetAll() {
     setBoxes([]);
     setDraftBox(null);
     setDragStart(null);
+  }
+
+  function resetView() {
+    setView({ scale: 1, tx: 0, ty: 0 });
   }
 
   function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -100,85 +104,78 @@ export default function App() {
     const url = URL.createObjectURL(f);
     setImageUrl(url);
     resetAll();
+    resetView();
   }
 
   function syncRefPreset(p: "paper" | "door" | "custom") {
     setRefPreset(p);
-    if (p === "paper") setRefRealInches(11); // use height
-    if (p === "door") setRefRealInches(80); // common door height
-    // custom leaves current value
+    if (p === "paper") setRefRealInches(11);
+    if (p === "door") setRefRealInches(80);
   }
 
-  const getCanvasAndImageScale = React.useCallback(() => {
-  const canvas = canvasRef.current;
-  const img = imgRef.current;
-  if (!canvas || !img || !imageNatural) return null;
+  /**
+   * Base "contain" geometry for mapping image px -> base canvas px (before zoom).
+   * Returns baseW/baseH + offsets in canvas CSS pixels, and baseScale (image->base).
+   */
+  const getCanvasAndImageScale = useCallback(() => {
+    const canvas = canvasRef.current;
+    const img = imgRef.current;
+    if (!canvas || !img || !imageNatural) return null;
 
-  const rect = canvas.getBoundingClientRect();
-  const displayW = rect.width;
-  const displayH = rect.height;
+    const rect = canvas.getBoundingClientRect();
+    const displayW = rect.width;
+    const displayH = rect.height;
 
-  // Base "contain" placement of image in the canvas
-  const imgAspect = imageNatural.w / imageNatural.h;
-  const canvasAspect = displayW / displayH;
+    const imgAspect = imageNatural.w / imageNatural.h;
+    const canvasAspect = displayW / displayH;
 
-  let baseW = displayW;
-  let baseH = displayH;
-  let baseOffsetX = 0;
-  let baseOffsetY = 0;
+    let baseW = displayW;
+    let baseH = displayH;
+    let baseOffsetX = 0;
+    let baseOffsetY = 0;
 
-  if (imgAspect > canvasAspect) {
-    baseW = displayW;
-    baseH = displayW / imgAspect;
-    baseOffsetY = (displayH - baseH) / 2;
-  } else {
-    baseH = displayH;
-    baseW = displayH * imgAspect;
-    baseOffsetX = (displayW - baseW) / 2;
+    if (imgAspect > canvasAspect) {
+      baseW = displayW;
+      baseH = displayW / imgAspect;
+      baseOffsetY = (displayH - baseH) / 2;
+    } else {
+      baseH = displayH;
+      baseW = displayH * imgAspect;
+      baseOffsetX = (displayW - baseW) / 2;
+    }
+
+    const baseScale = baseW / imageNatural.w;
+
+    return { canvas, rect, baseW, baseH, baseOffsetX, baseOffsetY, baseScale };
+  }, [imageNatural]);
+
+  function canvasPointToImagePoint(clientX: number, clientY: number) {
+    const info = getCanvasAndImageScale();
+    if (!info || !imageNatural) return null;
+
+    const { rect, baseOffsetX, baseOffsetY, baseScale } = info;
+
+    // Pointer in canvas CSS pixels
+    const xCanvas = clientX - rect.left;
+    const yCanvas = clientY - rect.top;
+
+    // remove base contain offset
+    const xInBase = xCanvas - baseOffsetX;
+    const yInBase = yCanvas - baseOffsetY;
+
+    // undo zoom/pan (view transform is in base space)
+    const xUnzoom = (xInBase - view.tx) / view.scale;
+    const yUnzoom = (yInBase - view.ty) / view.scale;
+
+    // base px -> image px
+    const xImg = xUnzoom / baseScale;
+    const yImg = yUnzoom / baseScale;
+
+    if (xImg < 0 || yImg < 0) return null;
+    if (xImg > imageNatural.w || yImg > imageNatural.h) return null;
+
+    return { x: xImg, y: yImg };
   }
-
-  // Base scale maps image px -> canvas px (before zoom)
-  const baseScale = baseW / imageNatural.w;
-
-  return {
-    canvas,
-    rect,
-    baseW,
-    baseH,
-    baseOffsetX,
-    baseOffsetY,
-    baseScale,
-  };
-}, [imageNatural]);
-
-function canvasPointToImagePoint(clientX: number, clientY: number) {
-  const info = getCanvasAndImageScale();
-  if (!info) return null;
-
-  const { rect, baseOffsetX, baseOffsetY, baseScale } = info;
-
-  // Pointer position in canvas CSS pixels
-  const xCanvas = clientX - rect.left;
-  const yCanvas = clientY - rect.top;
-
-  // Remove the base contain offset
-  const xInBase = xCanvas - baseOffsetX;
-  const yInBase = yCanvas - baseOffsetY;
-
-  // Undo our zoom/pan (view transform happens in base space)
-  const xUnzoom = (xInBase - view.tx) / view.scale;
-  const yUnzoom = (yInBase - view.ty) / view.scale;
-
-  // Convert base-space px -> image px
-  const xImg = xUnzoom / baseScale;
-  const yImg = yUnzoom / baseScale;
-
-  // Bounds check in image space
-  if (xImg < 0 || yImg < 0 || !imageNatural) return null;
-  if (xImg > imageNatural.w || yImg > imageNatural.h) return null;
-
-  return { x: xImg, y: yImg };
-}
 
   function handlePointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     if (!imageUrl) return;
@@ -187,13 +184,12 @@ function canvasPointToImagePoint(clientX: number, clientY: number) {
 
     setDragStart(pt);
 
-    // start a draft box at 1px to show feedback
     const label =
       activeDrawType === "reference"
         ? refPreset === "paper"
-          ? "Paper (11in tall)"
+          ? "Paper"
           : refPreset === "door"
-          ? "Door (80in tall)"
+          ? "Door"
           : "Reference"
         : `Window ${windowBoxes.length + 1}`;
 
@@ -232,14 +228,12 @@ function canvasPointToImagePoint(clientX: number, clientY: number) {
       return;
     }
 
-    // ignore tiny boxes
     if (draftBox.w < 10 || draftBox.h < 10) {
       setDraftBox(null);
       setDragStart(null);
       return;
     }
 
-    // If drawing reference, replace any existing reference box
     if (draftBox.type === "reference") {
       setBoxes((prev) => [
         ...prev.filter((b) => b.type !== "reference"),
@@ -270,7 +264,6 @@ function canvasPointToImagePoint(clientX: number, clientY: number) {
     const displayW = Math.floor(rect.width);
     const displayH = Math.floor(rect.height);
 
-    // set actual canvas backing store to match display size for crispness
     if (canvas.width !== displayW) canvas.width = displayW;
     if (canvas.height !== displayH) canvas.height = displayH;
 
@@ -278,53 +271,43 @@ function canvasPointToImagePoint(clientX: number, clientY: number) {
 
     const info = getCanvasAndImageScale();
     if (!info) return;
-    const { drawW, drawH, offsetX, offsetY, scale } = info;
 
-    const info = getCanvasAndImageScale();
-if (!info) return;
+    const { baseW, baseH, baseOffsetX, baseOffsetY, baseScale } = info;
 
-const { baseW, baseH, baseOffsetX, baseOffsetY, baseScale } = info;
+    // draw image with zoom/pan in base space
+    ctx.save();
+    ctx.translate(baseOffsetX + view.tx, baseOffsetY + view.ty);
+    ctx.scale(view.scale, view.scale);
+    ctx.drawImage(img, 0, 0, baseW, baseH);
+    ctx.restore();
 
-// draw image with zoom transform
-ctx.save();
-ctx.translate(baseOffsetX + view.tx, baseOffsetY + view.ty);
-ctx.scale(view.scale, view.scale);
-ctx.drawImage(img, 0, 0, baseW, baseH);
-ctx.restore();
-
-    // helper to draw a box from image coords
     const drawBox = (b: Box, stroke: string) => {
-      // box is in image px; convert to base canvas px
       const xBase = b.x * baseScale;
       const yBase = b.y * baseScale;
       const wBase = b.w * baseScale;
       const hBase = b.h * baseScale;
-    
-      // then apply view transform + base offsets
+
       const x = baseOffsetX + view.tx + xBase * view.scale;
       const y = baseOffsetY + view.ty + yBase * view.scale;
       const w = wBase * view.scale;
       const h = hBase * view.scale;
-    
-      ctx.lineWidth = window.innerWidth < 980 ? 3 : 2; // easier on mobile
+
+      ctx.lineWidth = window.innerWidth < 980 ? 3 : 2;
       ctx.strokeStyle = stroke;
       ctx.strokeRect(x, y, w, h);
     };
 
-    // existing boxes
     for (const b of boxes) {
       if (b.type === "reference") drawBox(b, "rgba(0,180,220,0.9)");
-  else drawBox(b, "rgba(255,200,0,0.9)");
+      else drawBox(b, "rgba(255,200,0,0.9)");
     }
 
-    // draft box
-   if (draftBox) {
-  const color = draftBox.type === "reference"
-    ? "rgba(0,180,220,0.9)"
-    : "rgba(255,200,0,0.9)";
-  drawBox(draftBox, color);
-}
-}, [boxes, draftBox, imageUrl, imageNatural, view, getCanvasAndImageScale]);
+    if (draftBox) {
+      const color =
+        draftBox.type === "reference" ? "rgba(0,180,220,0.9)" : "rgba(255,200,0,0.9)";
+      drawBox(draftBox, color);
+    }
+  }, [boxes, draftBox, imageUrl, imageNatural, view, getCanvasAndImageScale]);
 
   return (
     <div className="wrap">
@@ -341,22 +324,21 @@ ctx.restore();
         <section className="card">
           <h2>Photo</h2>
           <div className="row">
-          <input type="file" accept="image/*" onChange={onFileChange} />
+            <input type="file" accept="image/*" onChange={onFileChange} />
             <button className="btn" onClick={resetAll} disabled={!imageUrl}>
               Clear boxes
             </button>
-            <button className="btn" onClick={() => setView({ scale: 1, tx: 0, ty: 0 })} disabled={!imageUrl}>
-  Reset view
-</button>
+            <button className="btn" onClick={resetView} disabled={!imageUrl}>
+              Reset view
+            </button>
           </div>
 
           {!imageUrl ? (
             <div className="empty">
-              Upload a house/window photo. On iPhone, this will let you take a photo from the camera.
+              Upload a house/window photo. On iPhone, this will let you take a photo or choose from Photos.
             </div>
           ) : (
             <>
-              {/* Hidden image element used for drawing */}
               <img
                 ref={imgRef}
                 src={imageUrl}
@@ -369,75 +351,81 @@ ctx.restore();
               />
 
               <div className="canvasWrap">
-              <canvas
-  ref={canvasRef}
-  className="canvas"
-  onPointerDown={(e) => {
-    (e.currentTarget as HTMLCanvasElement).setPointerCapture(e.pointerId);
-    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+                <canvas
+                  ref={canvasRef}
+                  className="canvas"
+                  onPointerDown={(e) => {
+                    (e.currentTarget as HTMLCanvasElement).setPointerCapture(e.pointerId);
+                    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    // If 2 pointers -> start pinch
-    if (pointers.current.size === 2) {
-      const pts = Array.from(pointers.current.values());
-      const d = dist(pts[0], pts[1]);
-      const m = mid(pts[0], pts[1]);
-      pinchStart.current = { dist: d, mid: m, scale: view.scale, tx: view.tx, ty: view.ty };
-      // stop any box drawing
-      setDragStart(null);
-      setDraftBox(null);
-      return;
-    }
+                    // 2 pointers => pinch/2-finger pan
+                    if (pointers.current.size === 2) {
+                      const pts = Array.from(pointers.current.values());
+                      const d = dist(pts[0], pts[1]);
+                      const m = mid(pts[0], pts[1]);
+                      pinchStart.current = {
+                        dist: d,
+                        mid: m,
+                        scale: view.scale,
+                        tx: view.tx,
+                        ty: view.ty,
+                      };
+                      setDragStart(null);
+                      setDraftBox(null);
+                      return;
+                    }
 
-    // 1 pointer -> normal drawing
-    handlePointerDown(e);
-  }}
-  onPointerMove={(e) => {
-    if (!pointers.current.has(e.pointerId)) return;
-    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+                    // 1 pointer => draw
+                    handlePointerDown(e);
+                  }}
+                  onPointerMove={(e) => {
+                    if (!pointers.current.has(e.pointerId)) return;
+                    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-    // Pinch/2-finger pan
-    if (pointers.current.size === 2 && pinchStart.current) {
-      const pts = Array.from(pointers.current.values());
-      const dNow = dist(pts[0], pts[1]);
-      const mNow = mid(pts[0], pts[1]);
+                    // pinch
+                    if (pointers.current.size === 2 && pinchStart.current) {
+                      const pts = Array.from(pointers.current.values());
+                      const dNow = dist(pts[0], pts[1]);
+                      const mNow = mid(pts[0], pts[1]);
 
-      const start = pinchStart.current;
-      const nextScale = clampScale(start.scale * (dNow / start.dist));
+                      const start = pinchStart.current;
+                      const nextScale = clampScale(start.scale * (dNow / start.dist));
 
-      // Keep the midpoint anchored (pan as fingers move)
-      const dxMid = mNow.x - start.mid.x;
-      const dyMid = mNow.y - start.mid.y;
+                      // midpoint pan in screen space
+                      const dxMid = mNow.x - start.mid.x;
+                      const dyMid = mNow.y - start.mid.y;
 
-      setView({
-        scale: nextScale,
-        tx: start.tx + dxMid,
-        ty: start.ty + dyMid,
-      });
-      return;
-    }
+                      setView({
+                        scale: nextScale,
+                        tx: start.tx + dxMid,
+                        ty: start.ty + dyMid,
+                      });
+                      return;
+                    }
 
-    // 1 pointer -> normal drawing
-    handlePointerMove(e);
-  }}
-  onPointerUp={(e) => {
-    pointers.current.delete(e.pointerId);
+                    // draw
+                    handlePointerMove(e);
+                  }}
+                  onPointerUp={(e) => {
+                    pointers.current.delete(e.pointerId);
 
-    if (pointers.current.size < 2) {
-      pinchStart.current = null;
-    }
+                    if (pointers.current.size < 2) pinchStart.current = null;
 
-    // Only finish box draw if it was a 1-finger interaction
-    if (pointers.current.size === 0) {
-      handlePointerUp();
-    }
-  }}
-  onPointerCancel={(e) => {
-    pointers.current.delete(e.pointerId);
-    pinchStart.current = null;
-    setDragStart(null);
-    setDraftBox(null);
-  }}
-/>
+                    // Only finalize draw if this was a 1-finger gesture and no pointers remain
+                    if (pointers.current.size === 0) {
+                      handlePointerUp();
+                      pointers.current.clear();
+                      pinchStart.current = null;
+                    }
+                  }}
+                  onPointerCancel={(e) => {
+                    pointers.current.delete(e.pointerId);
+                    pinchStart.current = null;
+                    pointers.current.clear();
+                    setDragStart(null);
+                    setDraftBox(null);
+                  }}
+                />
               </div>
 
               <div className="row">
@@ -456,9 +444,7 @@ ctx.restore();
                   </button>
                 </div>
 
-                <div className="hint">
-                  Tip: reference first (paper/door), then windows. Drag a rectangle around each.
-                </div>
+                <div className="hint">Tip: two fingers pinch/drag to zoom + pan.</div>
               </div>
             </>
           )}
@@ -471,9 +457,7 @@ ctx.restore();
             <label className="label">Reference preset</label>
             <select
               value={refPreset}
-              onChange={(e) =>
-                syncRefPreset(e.target.value as "paper" | "door" | "custom")
-              }
+              onChange={(e) => syncRefPreset(e.target.value as "paper" | "door" | "custom")}
               className="input"
             >
               <option value="paper">Letter paper (11&quot; tall)</option>
@@ -491,7 +475,7 @@ ctx.restore();
               min={1}
               step={0.25}
               onChange={(e) => setRefRealInches(Number(e.target.value))}
-              disabled={refPreset !== "custom" && refPreset !== "paper" && refPreset !== "door" ? false : false}
+              disabled={refPreset !== "custom"}
             />
           </div>
 
@@ -499,9 +483,7 @@ ctx.restore();
             <div>
               <b>Reference box:</b>{" "}
               {referenceBox ? (
-                <>
-                  set ({Math.round(referenceBox.w)}×{Math.round(referenceBox.h)} px)
-                </>
+                <>set ({Math.round(referenceBox.w)}×{Math.round(referenceBox.h)} px)</>
               ) : (
                 <span className="warn">not set (draw it on the photo)</span>
               )}
@@ -520,8 +502,7 @@ ctx.restore();
               <b>Windows marked:</b> {windowBoxes.length}
             </div>
             <div>
-              <b>Total SqFt:</b>{" "}
-              {windowSqft ? round2(windowSqft) : <span className="warn">—</span>}
+              <b>Total SqFt:</b> {windowSqft ? round2(windowSqft) : <span className="warn">—</span>}
             </div>
           </div>
 
@@ -559,83 +540,85 @@ ctx.restore();
         </section>
 
         <section className="card">
-  <h2>Retail & Commission</h2>
+          <h2>Retail & Commission</h2>
 
-  {(!windowSqft || !pixelsPerInch) ? (
-    <div className="empty">
-      Draw a <b>reference</b> + at least one <b>window</b> to generate pricing.
-    </div>
-  ) : (
-    (() => {
-      const sqft = windowSqft;
-
-      const SOLAR_PER_SQFT = 12;     // fixed internal baseline
-      const RETAIL_LOW_PER_SQFT = 14;
-      const RETAIL_HIGH_PER_SQFT = 16;
-
-      const solarTotal = sqft * SOLAR_PER_SQFT;
-
-      const retailLowTotal = sqft * RETAIL_LOW_PER_SQFT;
-      const retailHighTotal = sqft * RETAIL_HIGH_PER_SQFT;
-
-      const commissionLow = retailLowTotal - solarTotal;
-      const commissionHigh = retailHighTotal - solarTotal;
-
-      const r2 = (n: number) => Math.round(n * 100) / 100;
-      const dollars = (n: number) => `$${Math.round(n).toLocaleString()}`;
-
-      return (
-        <div className="result">
-          <div className="kpi">
-            <div className="kpiLabel">Estimated window area</div>
-            <div className="kpiValue">{r2(sqft)} sq ft</div>
-          </div>
-
-          <div className="kpi">
-            <div className="kpiLabel">Suggested retail range</div>
-            <div className="kpiValue">
-              {dollars(retailLowTotal)} – {dollars(retailHighTotal)}
+          {(!windowSqft || !pixelsPerInch) ? (
+            <div className="empty">
+              Draw a <b>reference</b> + at least one <b>window</b> to generate pricing.
             </div>
-            <div className="muted">
-              ${RETAIL_LOW_PER_SQFT}–${RETAIL_HIGH_PER_SQFT}/sqft
-            </div>
-          </div>
+          ) : (
+            (() => {
+              const sqft = windowSqft;
 
-          <div className="kpi">
-            <div className="kpiLabel">Estimated commission</div>
-            <div className="kpiValue">
-              {dollars(commissionLow)} – {dollars(commissionHigh)}
-            </div>
-            <div className="muted">
-              Commission = Retail − Solar (${SOLAR_PER_SQFT}/sqft)
-            </div>
-          </div>
+              const SOLAR_PER_SQFT = 12;
+              const RETAIL_LOW_PER_SQFT = 14;
+              const RETAIL_HIGH_PER_SQFT = 15;
 
-          <button
-            className="btnPrimary"
-            onClick={() => {
-              const lines = [
-                `Window SqFt Estimate`,
-                `SqFt: ${r2(sqft)}`,
-                `Suggested retail: ${dollars(retailLowTotal)} – ${dollars(retailHighTotal)} (${RETAIL_LOW_PER_SQFT}–${RETAIL_HIGH_PER_SQFT}/sqft)`,
-                `Estimated commission: ${dollars(commissionLow)} – ${dollars(commissionHigh)} (Retail − Solar @ $${SOLAR_PER_SQFT}/sqft)`,
-              ];
-              navigator.clipboard.writeText(lines.join("\n"));
-              alert("Copied estimate to clipboard.");
-            }}
-          >
-            Copy estimate
-          </button>
-        </div>
-      );
-    })()
-  )}
-</section>
+              const solarTotal = sqft * SOLAR_PER_SQFT;
+              const retailLowTotal = sqft * RETAIL_LOW_PER_SQFT;
+              const retailHighTotal = sqft * RETAIL_HIGH_PER_SQFT;
+
+              const commissionLow = retailLowTotal - solarTotal;
+              const commissionHigh = retailHighTotal - solarTotal;
+
+              const dollars = (n: number) => `$${Math.round(n).toLocaleString()}`;
+
+              return (
+                <div className="result">
+                  <div className="kpi">
+                    <div className="kpiLabel">Estimated window area</div>
+                    <div className="kpiValue">{round2(sqft)} sq ft</div>
+                  </div>
+
+                  <div className="kpi">
+                    <div className="kpiLabel">Suggested retail range</div>
+                    <div className="kpiValue">
+                      {dollars(retailLowTotal)} – {dollars(retailHighTotal)}
+                    </div>
+                    <div className="muted">
+                      ${RETAIL_LOW_PER_SQFT}–${RETAIL_HIGH_PER_SQFT}/sqft
+                    </div>
+                  </div>
+
+                  <div className="kpi">
+                    <div className="kpiLabel">Estimated commission</div>
+                    <div className="kpiValue">
+                      {dollars(commissionLow)} – {dollars(commissionHigh)}
+                    </div>
+                    <div className="muted">
+                      Commission = Retail − Solar (${SOLAR_PER_SQFT}/sqft)
+                    </div>
+                  </div>
+
+                  <button
+                    className="btnPrimary"
+                    onClick={() => {
+                      const lines = [
+                        `Window SqFt Estimate`,
+                        `SqFt: ${round2(sqft)}`,
+                        `Suggested retail: ${dollars(retailLowTotal)} – ${dollars(
+                          retailHighTotal
+                        )} (${RETAIL_LOW_PER_SQFT}–${RETAIL_HIGH_PER_SQFT}/sqft)`,
+                        `Estimated commission: ${dollars(commissionLow)} – ${dollars(
+                          commissionHigh
+                        )} (Retail − Solar @ $${SOLAR_PER_SQFT}/sqft)`,
+                      ];
+                      navigator.clipboard.writeText(lines.join("\n"));
+                      alert("Copied estimate to clipboard.");
+                    }}
+                  >
+                    Copy estimate
+                  </button>
+                </div>
+              );
+            })()
+          )}
+        </section>
       </div>
 
       <footer className="footer">
-        Prototype notes: This is a “rough estimate” tool. Accuracy depends on a clean reference box and reasonably flat photo
-        perspective. Next iteration can add multi-photos per room/elevation + averaging.
+        Prototype notes: This is a “rough estimate” tool. Accuracy depends on a clean reference box and reasonably flat
+        photo perspective. Next iteration can add multi-photos per room/elevation + averaging.
       </footer>
     </div>
   );
